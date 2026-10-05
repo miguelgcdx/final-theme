@@ -1,0 +1,4 @@
+# Preserve the accepted source bytes; do not normalize checkout line endings.
+/themes/blue-theme-border-trial.json -text
+/patches/gentle-pi-4.0.0-agents-skill-rows.patch -text
+/LICENSES/GENTLE-PI-MIT.txt -text

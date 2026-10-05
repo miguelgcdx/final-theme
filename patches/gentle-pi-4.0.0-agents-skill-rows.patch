@@ -1,0 +1,231 @@
+--- a/lib/agents-protocol.ts
++++ b/lib/agents-protocol.ts
+@@ -118,6 +118,8 @@
+ 	agent: string;
+ 	mode: string;
+ 	prompt: string;
++	/** Bounded assignment labels from prompt/context; NOT skill execution evidence. */
++	assignedSkills?: readonly string[];
+ 	/** One line for the card: what the subagent is doing. */
+ 	label: string;
+ 	cwd: string;
+@@ -351,6 +353,86 @@
+ 	return compact.length > LABEL_MAX ? `${compact.slice(0, LABEL_MAX - 1)}…` : compact;
+ }
+ 
++const SKILLS_MAX = 4;
++const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
++
++/** Safe fallback for legacy records and untrusted persisted display metadata. */
++export function boundedSkillNames(value: unknown): string[] {
++	if (!Array.isArray(value)) return [];
++	const names: string[] = [];
++	const seen = new Set<string>();
++	for (const name of value.slice(0, SKILLS_MAX)) {
++		if (typeof name !== "string" || !SKILL_NAME.test(name) || name.includes("..") || seen.has(name.toLowerCase())) continue;
++		seen.add(name.toLowerCase());
++		names.push(name);
++	}
++	return names;
++}
++
++/** Parse assignment sections only, without reading/resolving any supplied path. */
++export function assignedSkillNames(prompt: string, context?: string): string[] {
++	const names: string[] = [];
++	const seen = new Set<string>();
++	for (const source of [prompt, context]) {
++		// Reject oversized inputs instead of cutting into a comment/fence/path.
++		if (!source || source.length > 65_536) continue;
++		let section = false;
++		let comment = false;
++		let untrusted = false;
++		let fence: { marker: string; length: number } | undefined;
++		for (const line of source.split(/\r?\n/).slice(0, 1024)) {
++			if (line.length > 2048) break;
++			const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
++			if (fence) {
++				if (delimiter && delimiter[1][0] === fence.marker && delimiter[1].length >= fence.length && delimiter[2].trim() === "") fence = undefined;
++				continue;
++			}
++			// Already-open blocks own the whole line, including apparent boundaries.
++			if (comment) {
++				if (line.includes("-->")) comment = false;
++				if (line.lastIndexOf("<!--") > line.lastIndexOf("-->")) comment = true;
++				continue;
++			}
++			if (untrusted) {
++				untrusted = !/<\/untrusted(?:_text)?\s*>/i.test(line);
++				continue;
++			}
++			// Visible fence openers and section boundaries take precedence over
++			// newly appearing comments; comment-bearing path entries still fail closed.
++			if (delimiter) {
++				fence = { marker: delimiter[1][0], length: delimiter[1].length };
++				continue;
++			}
++			// ATX headings (including 1–3 space indentation) and setext headings
++			// terminate the section; indented headings cannot start an assignment.
++			if (section && (/^ {0,3}#{1,6}(?:[ \t]|$)/.test(line) || /^ {0,3}(?:=+|-+)[ \t]*$/.test(line))) break;
++			if (line.includes("<!--")) {
++				comment = line.lastIndexOf("<!--") > line.lastIndexOf("-->");
++				continue;
++			}
++			if (/<untrusted(?:_text)?\b/i.test(line)) {
++				untrusted = !/<\/untrusted(?:_text)?\s*>/i.test(line);
++				continue;
++			}
++			if (!section) {
++				if (/^## Skills to load before work[ \t]*$/.test(line)) section = true;
++				continue;
++			}
++			const entry = /^ {0,3}(?:[-*+] +)?(?:`([^`]+)`|([^\s`]+))[ \t]*$/.exec(line);
++			const path = entry?.[1] ?? entry?.[2];
++			if (!path || path.length > 1024 || !/^(?:\/|~\/)[A-Za-z0-9_.@+\/-]+\/SKILL\.md$/.test(path)) continue;
++			const parts = path.replace(/^~?\//, "").split("/");
++			if (parts.some((part) => part === "" || part === "." || part === "..")) continue;
++			const name = parts[parts.length - 2];
++			if (!name || !SKILL_NAME.test(name) || name.includes("..") || seen.has(name.toLowerCase())) continue;
++			seen.add(name.toLowerCase());
++			names.push(name);
++			if (names.length === SKILLS_MAX) return names;
++		}
++	}
++	return names;
++}
++
+ export function emptyThread(limits: Partial<ThreadLimits> = {}): TaskThread {
+ 	return { items: [], dropped: 0, version: 0, limits: { ...DEFAULT_LIMITS, ...limits } };
+ }
+--- a/lib/agents-runner.ts
++++ b/lib/agents-runner.ts
+@@ -8,7 +8,7 @@
+ import { AGENT_MODE, formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
+ import { CHILD_QUERY_MAX_INFLIGHT, CHILD_QUERY_TIMEOUT_MS, parseChildFrame, validChildMessage, validChildQueryId } from "./agents-messaging.ts";
+ import { ParentStandingReviewPermissionBroker } from "./review-session-standing-permission-ipc.ts";
+-import { isFinished, normalizeRpcEvent, ToolArgumentProgress, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type ChildResponseObservation, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
++import { assignedSkillNames, isFinished, normalizeRpcEvent, ToolArgumentProgress, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type ChildResponseObservation, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
+ 
+ // Gentle Agents runner. Every subagent is its own `pi --mode rpc` process:
+ // the host never runs subagent work on the TUI thread. It writes JSON
+@@ -343,6 +343,7 @@
+ 			agent: request.agent.name,
+ 			mode: request.mode,
+ 			prompt: request.prompt,
++			assignedSkills: assignedSkillNames(request.prompt, request.context),
+ 			label: taskLabel(request.prompt, request.label),
+ 			cwd: request.cwd,
+ 			parentSessionId: request.parentSessionId,
+--- a/lib/agents-widget.ts
++++ b/lib/agents-widget.ts
+@@ -1,5 +1,5 @@
+-import { visibleWidth } from "@earendil-works/pi-tui";
+-import { isFinished, TASK_STATUS, type TaskRecord, type TaskStatus } from "./agents-protocol.ts";
++import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
++import { boundedSkillNames, isFinished, TASK_STATUS, type TaskRecord, type TaskStatus } from "./agents-protocol.ts";
+ import { formatCost, formatTokens } from "./shell-bar.ts";
+ import { CARD_TONE, panelExtraRows, panelInnerWidth, renderCard, type CardTheme, type CardTone } from "./shell-card.ts";
+ 
+@@ -17,6 +17,8 @@
+ 	// "… N more" line so the card never pushes the editor off the screen.
+ 	maxRows?: number;
+ 	viewKey?: string;
++	/** Host opt-in, evaluated from the active theme on every render. */
++	showSkills?: boolean;
+ }
+ 
+ interface StatusLook {
+@@ -149,6 +151,34 @@
+ 	return { listed, hidden: shown.length - listed.length };
+ }
+ 
++function skillLabel(task: TaskRecord): string | undefined {
++	const names = boundedSkillNames(task.assignedSkills);
++	const first = names[0];
++	return first ? `   ↳ ${first}${names.length > 1 ? ` +${names.length - 1}` : ""}` : undefined;
++}
++
++// Spend physical body rows on indivisible identity/skill pairs. Reserve the
++// existing overflow line before selecting by status priority, then draw the
++// selected prefix in start order. A one-row budget can show only overflow.
++function skillVisibleRows(shown: readonly TaskRecord[], budget: number, collapsed: boolean): { listed: TaskRecord[]; hidden: number } {
++	const cost = (task: TaskRecord) => skillLabel(task) ? 2 : 1;
++	if (collapsed) {
++		const first = shown[0];
++		// The existing expansion hint accounts for the remaining collapsed tasks.
++		return first && cost(first) <= budget ? { listed: [first], hidden: 0 } : { listed: [], hidden: shown.length };
++	}
++	const candidates = [...shown].sort((a, b) => SHOW_PRIORITY[a.status] - SHOW_PRIORITY[b.status] || startOrder(a, b));
++	if (candidates.reduce((sum, task) => sum + cost(task), 0) <= budget) return { listed: [...shown], hidden: 0 };
++	const listed: TaskRecord[] = [];
++	let remaining = budget - 1;
++	for (const task of candidates) {
++		if (cost(task) > remaining) break;
++		listed.push(task);
++		remaining -= cost(task);
++	}
++	return { listed: listed.sort(startOrder), hidden: shown.length - listed.length };
++}
++
+ function overflowRow(hidden: number, theme: CardTheme, viewKey: string | undefined): string {
+ 	const hint = viewKey ? ` · ${viewKey} to view` : "";
+ 	return theme.fg(META_ROLE, `${ELLIPSIS} ${hidden} more${hint}`);
+@@ -301,19 +331,38 @@
+ 	const shown = widgetTasks(tasks, now);
+ 	if (shown.length === 0) return [];
+ 	const cols = columns(shown, panelInnerWidth(theme, width, tone(shown)), now);
+-	// The float panel spends two more rows on padding above its header and the
+-	// separator below it, so it gives them back from the task budget to stay as
+-	// tall as the frame.
+-	const extraRows = panelExtraRows(theme, width, tone(shown));
++	// This theme's compact float card returns its two trimmed chrome rows to
++	// the body budget. All other cards retain their original padding/budget.
++	const floatExtraRows = panelExtraRows(theme, width, tone(shown));
++	const compact = options.showSkills === true && floatExtraRows === 2;
++	const extraRows = compact ? 0 : floatExtraRows;
+ 	const maxRows = options.maxRows === undefined ? undefined : options.maxRows - extraRows;
+-	const { listed, hidden } = options.collapsed ? { listed: [shown[0]], hidden: 0 } : visibleRows(shown, maxRows, extraRows > 0);
++	// Keep the exact old path for other themes and cards without assignments.
++	const showSkills = options.showSkills === true && shown.some((task) => skillLabel(task) !== undefined);
++	const budget = Math.max(0, Math.floor(Math.min(ROWS_MAX, options.maxRows ?? ROWS_MAX) - extraRows));
++	const { listed, hidden } = showSkills
++		? skillVisibleRows(shown, budget, options.collapsed)
++		: options.collapsed ? { listed: [shown[0]], hidden: 0 } : visibleRows(shown, maxRows, extraRows > 0);
+ 	const hint = options.collapsed && options.collapseKey ? `${options.collapseKey} expand` : shown.length > 1 ? batchElapsed(shown, now) : undefined;
+-	const body = listed.flatMap((task) => row(task, theme, cols, now, options.maxRows === undefined));
+-	if (hidden > 0) body.push(overflowRow(hidden, theme, options.viewKey));
+-	return renderCard(
++	const body = listed.flatMap((task) => {
++		const primary = row(task, theme, cols, now, !showSkills && options.maxRows === undefined);
++		const label = showSkills ? skillLabel(task) : undefined;
++		const fitted = showSkills ? primary.map((line) => truncateToWidth(line, cols.inner)) : primary;
++		return label === undefined ? fitted : [...fitted, theme.fg("dim", truncateToWidth(label, cols.inner))];
++	});
++	if (hidden > 0 && (!showSkills || budget > 0)) {
++		const overflow = overflowRow(hidden, theme, options.viewKey);
++		body.push(showSkills ? truncateToWidth(overflow, cols.inner) : overflow);
++	}
++	const lines = renderCard(
+ 		{ title: "Agents", subtitle: counts(shown), body, tone: tone(shown), glyph: AGENTS_GLYPH },
+ 		theme,
+ 		width,
+ 		{ expanded: true, hint, panel: true },
+ 	);
++	const header = lines[1];
++	if (!compact || header === undefined || lines.length < (body.length > 0 ? 5 : 3)) return lines;
++	// Remove only the known float top/bottom padding and header separator;
++	// keep header/body strings and their natural line spacing, including ANSI.
++	return [header, ...lines.slice(body.length > 0 ? 3 : 2, -1)];
+ }
+--- a/extensions/gentle-agents.ts
++++ b/extensions/gentle-agents.ts
+@@ -1175,7 +1175,9 @@
+ 			return {
+ 				render(width: number) {
+ 					if (!agentsVisible) return [];
+-					const lines = renderAgentsCard(visibleTasks(), theme, width, deps.now(), { collapsed, collapseKey, maxRows: widgetRows(tui.terminal?.rows), viewKey });
++					// Pi supplies its live public Theme proxy here; read its name at
++					// render time so theme switching does not latch launch-time state.
++					const lines = renderAgentsCard(visibleTasks(), theme, width, deps.now(), { collapsed, collapseKey, maxRows: widgetRows(tui.terminal?.rows), viewKey, showSkills: theme.name === "blue-theme-border-trial" });
+ 					return lines.length === 0 ? [] : [...lines, ""];
+ 				},
+ 				invalidate() {},

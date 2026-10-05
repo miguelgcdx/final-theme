@@ -1,0 +1,16 @@
+{
+  "theme": "blue-theme-border-trial",
+  "packages": [
+    {
+      "source": "npm:gentle-pi",
+      "extensions": ["!extensions/gentle-agents.ts"]
+    },
+    {
+      "source": "./packages/blue-theme-border-trial-gentle-pi",
+      "extensions": ["extensions/gentle-agents.ts"],
+      "themes": [],
+      "prompts": [],
+      "skills": []
+    }
+  ]
+}
